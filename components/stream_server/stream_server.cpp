@@ -8,12 +8,127 @@
 #include "esphome/components/network/util.h"
 #include "esphome/components/socket/socket.h"
 
+#include <vector>
+#include <algorithm>
+#include <errno.h>
+
+// ESP-IDF RMT/GPIO
+#include "driver/rmt.h"
+#include "driver/gpio.h"
+
 static const char *TAG = "stream_server";
 
 using namespace esphome;
 
+// -----------------------------
+// HBS via RMT (ESP-IDF legacy)
+// -----------------------------
+#define HBS_TX_GPIO          GPIO_NUM_17  // <-- cambia qui il pin di uscita HBS
+#define HBS_CLK_DIV          80           // 80MHz / 80 = 1 tick = 1 µs
+#define HBS_BIT_US           104
+#define HBS_HALF_BIT_US      52
+
+static bool g_hbs_inited = false;
+
+static inline rmt_item32_t hbs_item(int level0, int dur0, int level1, int dur1) {
+  rmt_item32_t it;
+  it.level0 = level0;
+  it.duration0 = dur0;
+  it.level1 = level1;
+  it.duration1 = dur1;
+  return it;
+}
+
+// Codifica un byte in simboli RMT secondo lo schema HBS.
+// Ritorna il numero di item scritti nel vettore.
+static size_t hbs_encode_byte(uint8_t data, std::vector<rmt_item32_t> &items) {
+  size_t before = items.size();
+
+  // Start: 52us LOW + 52us HIGH
+  items.push_back(hbs_item(0, HBS_HALF_BIT_US, 1, HBS_HALF_BIT_US));
+
+  // Dati LSB first + conteggio parità
+  int ones = 0;
+  for (int i = 0; i < 8; i++) {
+    int bit = (data >> i) & 1;
+    if (bit) {
+      // 1 → 104us HIGH
+      items.push_back(hbs_item(1, HBS_BIT_US, 1, 0));
+      ones++;
+    } else {
+      // 0 → 52us LOW + 52us HIGH
+      items.push_back(hbs_item(0, HBS_HALF_BIT_US, 1, HBS_HALF_BIT_US));
+    }
+  }
+
+  // Parità even
+  bool parity_one = (ones % 2) != 0; // se #1 è dispari, parità deve essere 1
+  if (parity_one) {
+    items.push_back(hbs_item(1, HBS_BIT_US, 1, 0));
+  } else {
+    items.push_back(hbs_item(0, HBS_HALF_BIT_US, 1, HBS_HALF_BIT_US));
+  }
+
+  // Stop: 104us HIGH
+  items.push_back(hbs_item(1, HBS_BIT_US, 1, 0));
+
+  return items.size() - before;
+}
+
+static void hbs_init() {
+  if (g_hbs_inited) return;
+
+  // Config RMT TX su HBS_TX_GPIO
+  rmt_config_t cfg = RMT_DEFAULT_CONFIG_TX(HBS_TX_GPIO, RMT_CHANNEL_0);
+  cfg.clk_div = HBS_CLK_DIV;                 // 1 tick = 1 µs
+  cfg.tx_config.idle_output_en = true;       // mantieni livello idle
+  cfg.tx_config.idle_level = RMT_IDLE_LEVEL_HIGH; // idle HIGH
+
+  ESP_ERROR_CHECK(rmt_config(&cfg));
+  ESP_ERROR_CHECK(rmt_driver_install(cfg.channel, 0, 0));
+
+  // Porta il pin HIGH (idle) anche lato GPIO
+  gpio_config_t io = {
+    .pin_bit_mask = (1ULL << HBS_TX_GPIO),
+    .mode = GPIO_MODE_OUTPUT,
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE
+  };
+  gpio_config(&io);
+  gpio_set_level(HBS_TX_GPIO, 1);
+
+  g_hbs_inited = true;
+}
+
+// Invio non bloccante: codifica 'len' byte in un buffer di item e lancia rmt_write_items(..., wait=false)
+static void hbs_send_bytes(const uint8_t *data, size_t len) {
+  if (!g_hbs_inited) hbs_init();
+
+  // Ogni byte → 1 start + 8 data + 1 parity + 1 stop = 11 item
+  // (usiamo std::vector per semplicità)
+  std::vector<rmt_item32_t> items;
+  items.reserve(len * 12);
+
+  for (size_t i = 0; i < len; i++) {
+    hbs_encode_byte(data[i], items);
+  }
+
+  // Non bloccante
+  // NOTE: se invii chiamate in rapida successione potresti voler
+  // controllare lo stato della coda o usare un mutex.
+  ESP_ERROR_CHECK(rmt_write_items(RMT_CHANNEL_0, items.data(), items.size(), false));
+}
+
+// -----------------------------
+// StreamServer originale
+// -----------------------------
+
 void StreamServerComponent::setup() {
     ESP_LOGCONFIG(TAG, "Setting up stream server...");
+
+    // init HBS (aggiunta)
+    hbs_init();
 
     // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
     this->buf_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->buf_size_]};
@@ -149,6 +264,7 @@ void StreamServerComponent::flush() {
     }
 }
 
+// --- MODIFICATA: TCP -> HBS su GPIO via RMT (non bloccante)
 void StreamServerComponent::write() {
     uint8_t buf[128];
     ssize_t read;
@@ -156,8 +272,10 @@ void StreamServerComponent::write() {
         if (client.disconnected)
             continue;
 
-        while ((read = client.socket->read(&buf, sizeof(buf))) > 0)
-            this->stream_->write_array(buf, read);
+        while ((read = client.socket->read(&buf, sizeof(buf))) > 0) {
+            // Trasmette i byte ricevuti dal client TCP usando HBS via RMT
+            hbs_send_bytes(buf, static_cast<size_t>(read));
+        }
 
         if (read == 0 || errno == ECONNRESET) {
             ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());

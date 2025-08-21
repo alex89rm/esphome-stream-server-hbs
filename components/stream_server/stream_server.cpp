@@ -8,94 +8,17 @@
 #include "esphome/components/network/util.h"
 #include "esphome/components/socket/socket.h"
 
-#include "driver/rmt_tx.h"
+#define HBS_GPIO_PIN 17
+static const char *TAG = "stream_server";
+
 
 using namespace esphome;
 
-static const char *TAG = "stream_server";
-
-// --- HBS config ---
-#define HBS_GPIO_PIN 17
-#define HBS_BIT_US   104
-#define HBS_HALF_US  52
-#define RMT_RESOLUTION_HZ 1000000
-
-static rmt_channel_handle_t hbs_channel = nullptr;
-
-namespace esphome {
-namespace stream_server {
-
-// Client constructor
-StreamServerComponent::Client::Client(std::unique_ptr<esphome::socket::Socket> socket,
-                                      std::string identifier, size_t position)
-    : socket(std::move(socket)), identifier{identifier}, position{position} {}
-
-// --- HBS / RMT helpers ---
-void init_hbs_rmt() {
-    if (hbs_channel != nullptr) return;
-
-    rmt_tx_channel_config_t tx_chan_config = {};
-    tx_chan_config.gpio_num = (gpio_num_t)HBS_GPIO_PIN;
-    tx_chan_config.resolution_hz = RMT_RESOLUTION_HZ;
-    tx_chan_config.mem_block_symbols = 64;
-    tx_chan_config.trans_queue_depth = 4;
-    tx_chan_config.flags.with_dma = false;
-
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &hbs_channel));
-    ESP_ERROR_CHECK(rmt_enable(hbs_channel));
-}
-
-static void hbs_send_byte(uint8_t data) {
-    rmt_symbol_word_t symbols[32];
-    int idx = 0;
-
-    // Start bit
-    symbols[idx].level0 = 0; symbols[idx].duration0 = HBS_HALF_US;
-    symbols[idx].level1 = 1; symbols[idx].duration1 = HBS_HALF_US;
-    idx++;
-
-    int ones = 0;
-    // Data bits LSB first
-    for (int i = 0; i < 8; i++) {
-        bool bit = data & (1 << i);
-        if (bit) {
-            symbols[idx].level0 = 1; symbols[idx].duration0 = HBS_BIT_US;
-            symbols[idx].level1 = 1; symbols[idx].duration1 = 0;
-            ones++;
-        } else {
-            symbols[idx].level0 = 0; symbols[idx].duration0 = HBS_HALF_US;
-            symbols[idx].level1 = 1; symbols[idx].duration1 = HBS_HALF_US;
-        }
-        idx++;
-    }
-
-    // Parità even
-    bool parity = (ones % 2) ? 1 : 0;
-    if (parity) {
-        symbols[idx].level0 = 1; symbols[idx].duration0 = HBS_BIT_US;
-        symbols[idx].level1 = 1; symbols[idx].duration1 = 0;
-    } else {
-        symbols[idx].level0 = 0; symbols[idx].duration0 = HBS_HALF_US;
-        symbols[idx].level1 = 1; symbols[idx].duration1 = HBS_HALF_US;
-    }
-    idx++;
-
-    // Stop bit
-    symbols[idx].level0 = 1; symbols[idx].duration0 = HBS_BIT_US;
-    symbols[idx].level1 = 1; symbols[idx].duration1 = 0;
-    idx++;
-
-    rmt_transmit_config_t tx_config = { .loop_count = 0 };
-    ESP_ERROR_CHECK(rmt_transmit(hbs_channel, symbols, idx * sizeof(rmt_symbol_word_t), &tx_config));
-}
-
-// --- StreamServerComponent methods ---
 void StreamServerComponent::setup() {
     ESP_LOGCONFIG(TAG, "Setting up stream server...");
-
-    // Setup RMT HBS
-    init_hbs_rmt();
-
+    // Configura il pin di output
+    gpio_set_direction((gpio_num_t)HBS_GPIO_PIN, GPIO_MODE_OUTPUT);
+    // The make_unique() wrapper doesn't like arrays, so initialize the unique_ptr directly.
     this->buf_ = std::unique_ptr<uint8_t[]>{new uint8_t[this->buf_size_]};
 
     struct sockaddr_storage bind_addr;
@@ -124,6 +47,12 @@ void StreamServerComponent::loop() {
 void StreamServerComponent::dump_config() {
     ESP_LOGCONFIG(TAG, "Stream Server:");
     ESP_LOGCONFIG(TAG, "  Address: %s:%u", esphome::network::get_use_address().c_str(), this->port_);
+#ifdef USE_BINARY_SENSOR
+    LOG_BINARY_SENSOR("  ", "Connected:", this->connected_sensor_);
+#endif
+#ifdef USE_SENSOR
+    LOG_SENSOR("  ", "Connection count:", this->connection_count_sensor_);
+#endif
 }
 
 void StreamServerComponent::on_shutdown() {
@@ -131,18 +60,29 @@ void StreamServerComponent::on_shutdown() {
         client.socket->shutdown(SHUT_RDWR);
 }
 
-void StreamServerComponent::publish_sensor() {}
+void StreamServerComponent::publish_sensor() {
+#ifdef USE_BINARY_SENSOR
+    if (this->connected_sensor_)
+        this->connected_sensor_->publish_state(this->clients_.size() > 0);
+#endif
+#ifdef USE_SENSOR
+    if (this->connection_count_sensor_)
+        this->connection_count_sensor_->publish_state(this->clients_.size());
+#endif
+}
 
 void StreamServerComponent::accept() {
     struct sockaddr_storage client_addr;
     socklen_t client_addrlen = sizeof(client_addr);
     std::unique_ptr<socket::Socket> socket = this->socket_->accept(reinterpret_cast<struct sockaddr *>(&client_addr), &client_addrlen);
-    if (!socket) return;
+    if (!socket)
+        return;
 
     socket->setblocking(false);
     std::string identifier = socket->getpeername();
     this->clients_.emplace_back(std::move(socket), identifier, this->buf_head_);
     ESP_LOGD(TAG, "New client connected from %s", identifier.c_str());
+    this->publish_sensor();
 }
 
 void StreamServerComponent::cleanup() {
@@ -150,6 +90,7 @@ void StreamServerComponent::cleanup() {
     auto last_client = std::partition(this->clients_.begin(), this->clients_.end(), discriminator);
     if (last_client != this->clients_.end()) {
         this->clients_.erase(last_client, this->clients_.end());
+        this->publish_sensor();
     }
 }
 
@@ -158,8 +99,23 @@ void StreamServerComponent::read() {
     int available;
     while ((available = this->stream_->available()) > 0) {
         size_t free = this->buf_size_ - (this->buf_head_ - this->buf_tail_);
-        if (free == 0) return;
+        if (free == 0) {
+            // Only overwrite if nothing has been added yet, otherwise give flush() a chance to empty the buffer first.
+            if (len > 0)
+                return;
 
+            ESP_LOGE(TAG, "Incoming bytes available, but outgoing buffer is full: stream will be corrupted!");
+            free = std::min<size_t>(available, this->buf_size_);
+            this->buf_tail_ += free;
+            for (Client &client : this->clients_) {
+                if (client.position < this->buf_tail_) {
+                    ESP_LOGW(TAG, "Dropped %u pending bytes for client %s", this->buf_tail_ - client.position, client.identifier.c_str());
+                    client.position = this->buf_tail_;
+                }
+            }
+        }
+
+        // Fill all available contiguous space in the ring buffer.
         len = std::min<size_t>(available, std::min<size_t>(this->buf_ahead(this->buf_head_), free));
         this->stream_->read_array(&this->buf_[this->buf_index(this->buf_head_)], len);
         this->buf_head_ += len;
@@ -173,6 +129,8 @@ void StreamServerComponent::flush() {
         if (client.disconnected || client.position == this->buf_head_)
             continue;
 
+        // Split the write into two parts: from the current position to the end of the ring buffer, and from the start
+        // of the ring buffer until the head. The second part might be zero if no wraparound is necessary.
         struct iovec iov[2];
         iov[0].iov_base = &this->buf_[this->buf_index(client.position)];
         iov[0].iov_len = std::min(this->buf_head_ - client.position, this->buf_ahead(client.position));
@@ -181,32 +139,46 @@ void StreamServerComponent::flush() {
         if ((written = client.socket->writev(iov, 2)) > 0) {
             client.position += written;
         } else if (written == 0 || errno == ECONNRESET) {
+            ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
-            continue;
+            continue;  // don't consider this client when calculating the tail position
+        } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            // Expected if the (TCP) transmit buffer is full, nothing to do.
+        } else {
+            ESP_LOGE(TAG, "Failed to write to client %s with error %d!", client.identifier.c_str(), errno);
         }
+
+        this->buf_tail_ = std::min(this->buf_tail_, client.position);
     }
 }
 
-// --- write con HBS ---
 void StreamServerComponent::write() {
     uint8_t buf[128];
     ssize_t read;
-
     for (Client &client : this->clients_) {
-        if (client.disconnected) continue;
+        if (client.disconnected)
+            continue;
 
-        while ((read = client.socket->read(&buf, sizeof(buf))) > 0) {
-            for (int i = 0; i < read; i++)
-                hbs_send_byte(buf[i]);
-        }
+        while ((read = client.socket->read(&buf, sizeof(buf))) > 0)
+             for (int i = 0; i < read; i++) {
+                // Qui pilotiamo il GPIO in modo bloccante
+                ESP_LOGD(TAG, "Sto pilotando il pin 17");
+                gpio_set_level((gpio_num_t)HBS_GPIO_PIN, 0);  // livello basso
+                esp_rom_delay_us(52);                         // 52 us
+                gpio_set_level((gpio_num_t)HBS_GPIO_PIN, 1);  // livello alto
+                esp_rom_delay_us(52);                         // 52 us
+            }
 
         if (read == 0 || errno == ECONNRESET) {
+            ESP_LOGD(TAG, "Client %s disconnected", client.identifier.c_str());
             client.disconnected = true;
-        } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            // Expected if the (TCP) receive buffer is empty, nothing to do.
+        } else {
             ESP_LOGW(TAG, "Failed to read from client %s with error %d!", client.identifier.c_str(), errno);
         }
     }
 }
 
-}  // namespace stream_server
-}  // namespace esphome
+StreamServerComponent::Client::Client(std::unique_ptr<esphome::socket::Socket> socket, std::string identifier, size_t position)
+    : socket(std::move(socket)), identifier{identifier}, position{position} {}

@@ -23,7 +23,7 @@ using namespace esphome;
 // -----------------------------
 // HBS via RMT (ESP-IDF legacy)
 // -----------------------------
-#define HBS_TX_GPIO          GPIO_NUM_17  // <-- cambia qui il pin di uscita HBS
+#define HBS_TX_GPIO          GPIO17 // <-- cambia qui il pin di uscita HBS
 #define HBS_CLK_DIV          80           // 80MHz / 80 = 1 tick = 1 µs
 #define HBS_BIT_US           104
 #define HBS_HALF_BIT_US      52

@@ -8,6 +8,7 @@
 #include "esphome/components/network/util.h"
 #include "esphome/components/socket/socket.h"
 
+#include "driver/gpio.h"
 #define HBS_GPIO_PIN 17
 static const char *TAG = "stream_server";
 

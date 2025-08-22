@@ -153,6 +153,13 @@ void StreamServerComponent::flush() {
     }
 }
 
+hbs_write_bit(uint8_t value){
+    gpio_set_level((gpio_num_t)HBS_GPIO_PIN, value);  // livello basso
+    esp_rom_delay_us(52);                         // 52 us
+    gpio_set_level((gpio_num_t)HBS_GPIO_PIN, 1);  // livello alto
+    esp_rom_delay_us(52);     
+}
+
 void StreamServerComponent::write() {
     uint8_t buf[128];
     ssize_t read;
@@ -162,12 +169,24 @@ void StreamServerComponent::write() {
 
         while ((read = client.socket->read(&buf, sizeof(buf))) > 0)
              for (int i = 0; i < read; i++) {
-                // Qui pilotiamo il GPIO in modo bloccante
-                ESP_LOGD(TAG, "Sto pilotando il pin 17");
-                gpio_set_level((gpio_num_t)HBS_GPIO_PIN, 0);  // livello basso
-                esp_rom_delay_us(52);                         // 52 us
-                gpio_set_level((gpio_num_t)HBS_GPIO_PIN, 1);  // livello alto
-                esp_rom_delay_us(52);                         // 52 us
+                 // Byte da trasmettere
+                 uint8_t byte = buf[i];
+                 
+                 // Start bit
+                 hbs_write_bit(0);
+                 // 8 data bit (LSB first, tipico delle UART)
+                 for (int b = 0; b < 8; b++) {
+                     uint8_t bit = (byte >> b) & 0x01;
+                     hbs_write_bit(bit);
+                 }
+                 
+                 // Stop bit
+                 hbs_write_bit(1);
+                 // Qui pilotiamo il GPIO 
+                 // Start bit
+                 hbs_write_bit(0);
+                 // 8 bit
+                 ESP_LOGD(TAG, "Byte inviato: %s", byte);                       
             }
 
         if (read == 0 || errno == ECONNRESET) {
